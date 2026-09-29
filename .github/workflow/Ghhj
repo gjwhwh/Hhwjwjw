@@ -1,0 +1,449 @@
+package com.example.glassray
+
+import android.app.Application
+import android.content.Context
+import android.content.Intent
+import android.net.VpnService
+import android.os.Bundle
+import android.os.ParcelFileDescriptor
+import android.util.Base64
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Text
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.BlurredEdgeTreatment
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.URI
+import java.net.URLDecoder
+import java.util.UUID
+
+/* ───────────── مدل و پارسر لینک ───────────── */
+
+data class Server(
+    val id: String,
+    val name: String,
+    val protocol: String,
+    val host: String,
+    val port: Int,
+    val raw: String,
+    val pingMs: Int? = null,
+)
+
+object LinkParser {
+    fun parse(text: String): List<Server> =
+        text.lineSequence().map { it.trim() }.filter { it.contains("://") }
+            .mapNotNull { runCatching { one(it) }.getOrNull() }.toList()
+
+    private fun one(link: String): Server? {
+        val scheme = link.substringBefore("://").lowercase()
+        if (scheme == "vmess") {
+            val body = link.removePrefix("vmess://")
+            val j = JSONObject(String(Base64.decode(body, Base64.DEFAULT)))
+            val host = j.getString("add")
+            val port = j.optString("port").toInt()
+            return Server(UUID.randomUUID().toString(), j.optString("ps", host), "vmess", host, port, link)
+        }
+        if (scheme in listOf("vless", "trojan", "ss")) {
+            val u = URI(link)
+            val name = u.rawFragment?.let { URLDecoder.decode(it, "UTF-8") } ?: u.host
+            return Server(UUID.randomUUID().toString(), name, scheme, u.host, u.port, link)
+        }
+        return null
+    }
+}
+
+/* ───────────── ذخیره‌سازی ───────────── */
+
+class ServerStore(ctx: Context) {
+    private val sp = ctx.getSharedPreferences("glassray", Context.MODE_PRIVATE)
+
+    fun load(): List<Server> {
+        val arr = JSONArray(sp.getString("servers", "[]"))
+        return (0 until arr.length()).map {
+            val o = arr.getJSONObject(it)
+            Server(
+                o.getString("id"), o.getString("name"), o.getString("protocol"),
+                o.getString("host"), o.getInt("port"), o.getString("raw")
+            )
+        }
+    }
+
+    fun save(list: List<Server>) {
+        val arr = JSONArray()
+        list.forEach {
+            arr.put(
+                JSONObject().put("id", it.id).put("name", it.name).put("protocol", it.protocol)
+                    .put("host", it.host).put("port", it.port).put("raw", it.raw)
+            )
+        }
+        sp.edit().putString("servers", arr.toString()).apply()
+    }
+
+    fun selected(): String? = sp.getString("selected", null)
+    fun select(id: String?) = sp.edit().putString("selected", id).apply()
+}
+
+/* ───────────── هسته و سرویس VPN ─────────────
+ * VpnService فقط کارت شبکه‌ی مجازی (TUN) را می‌سازد.
+ * برای عبور واقعی ترافیک باید هسته‌ی Xray/V2Ray به CoreBridge وصل شود.
+ */
+object CoreBridge {
+    fun start(link: String, tunFd: Int) {
+        // TODO: اتصال به هسته‌ی Xray/V2Ray
+    }
+
+    fun stop() {
+        // TODO: توقف هسته
+    }
+}
+
+object VpnState {
+    val connected = MutableStateFlow(false)
+}
+
+/** بعد از اتصال هسته این را true کن تا کل ترافیک از TUN عبور کند */
+const val CORE_READY = false
+const val ACTION_STOP = "com.example.glassray.STOP"
+const val EXTRA_LINK = "link"
+
+class GlassVpnService : VpnService() {
+    private var tun: ParcelFileDescriptor? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            closeTun(); stopSelf(); return START_NOT_STICKY
+        }
+        startVpn(intent?.getStringExtra(EXTRA_LINK).orEmpty())
+        return START_NOT_STICKY
+    }
+
+    private fun startVpn(link: String) {
+        closeTun()
+        val b = Builder()
+            .setSession("GlassRay")
+            .addAddress("10.10.0.2", 32)
+            .addDnsServer("1.1.1.1")
+            .setMtu(1500)
+        // تا وقتی هسته وصل نشده، کل ترافیک را به TUN نمی‌بریم تا اینترنت قطع نشود
+        if (CORE_READY) b.addRoute("0.0.0.0", 0) else b.addRoute("10.10.0.0", 24)
+        tun = b.establish()
+        tun?.let { CoreBridge.start(link, it.fd); VpnState.connected.value = true }
+    }
+
+    private fun closeTun() {
+        CoreBridge.stop()
+        tun?.close(); tun = null
+        VpnState.connected.value = false
+    }
+
+    override fun onDestroy() {
+        closeTun(); super.onDestroy()
+    }
+}
+
+/* ───────────── ViewModel ───────────── */
+
+class MainVM(app: Application) : AndroidViewModel(app) {
+    private val store = ServerStore(app)
+    private val _servers = MutableStateFlow(store.load())
+    val servers: StateFlow<List<Server>> = _servers
+    private val _selectedId = MutableStateFlow(store.selected())
+    val selectedId: StateFlow<String?> = _selectedId
+
+    fun selected(): Server? = _servers.value.firstOrNull { it.id == _selectedId.value }
+
+    fun import(text: String): Int {
+        val found = LinkParser.parse(text)
+        if (found.isEmpty()) return 0
+        _servers.value = _servers.value + found
+        store.save(_servers.value)
+        if (_selectedId.value == null) select(found.first().id)
+        return found.size
+    }
+
+    fun select(id: String) {
+        _selectedId.value = id; store.select(id)
+    }
+
+    fun delete(id: String) {
+        _servers.value = _servers.value.filterNot { it.id == id }
+        store.save(_servers.value)
+        if (_selectedId.value == id) {
+            _selectedId.value = _servers.value.firstOrNull()?.id
+            store.select(_selectedId.value)
+        }
+    }
+
+    fun pingAll() = viewModelScope.launch(Dispatchers.IO) {
+        val result = _servers.value.map { s ->
+            async {
+                val ms = runCatching {
+                    val t = System.nanoTime()
+                    Socket().use { it.connect(InetSocketAddress(s.host, s.port), 2500) }
+                    ((System.nanoTime() - t) / 1_000_000).toInt()
+                }.getOrDefault(-1)
+                s.copy(pingMs = ms)
+            }
+        }.awaitAll()
+        _servers.value = result
+    }
+}
+
+/* ───────────── طراحی شیشه‌ای ───────────── */
+
+private val Ink = Color(0xFF071B22)
+private val Deep = Color(0xFF0C2C36)
+private val Aqua = Color(0xFF5EE6D4)
+private val Violet = Color(0xFF8B7CFF)
+private val Coral = Color(0xFFFF7A6B)
+private val TextMain = Color(0xFFEAF6F7)
+private val TextDim = Color(0xFF9DBBC0)
+
+@Composable
+private fun GlassBackground(content: @Composable BoxScope.() -> Unit) {
+    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Ink, Deep)))) {
+        Box(
+            Modifier.align(Alignment.TopStart).offset((-90).dp, 40.dp).size(300.dp)
+                .blur(100.dp, BlurredEdgeTreatment.Unbounded).background(Aqua.copy(.45f), CircleShape)
+        )
+        Box(
+            Modifier.align(Alignment.CenterEnd).offset(90.dp, 120.dp).size(280.dp)
+                .blur(100.dp, BlurredEdgeTreatment.Unbounded).background(Violet.copy(.40f), CircleShape)
+        )
+        Box(
+            Modifier.align(Alignment.BottomStart).offset((-60).dp, 60.dp).size(240.dp)
+                .blur(100.dp, BlurredEdgeTreatment.Unbounded).background(Coral.copy(.22f), CircleShape)
+        )
+        content()
+    }
+}
+
+@Composable
+private fun GlassCard(
+    modifier: Modifier = Modifier,
+    shape: RoundedCornerShape = RoundedCornerShape(22.dp),
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Column(
+        modifier
+            .clip(shape)
+            .background(Brush.linearGradient(listOf(Color.White.copy(.16f), Color.White.copy(.05f))))
+            .border(
+                BorderStroke(1.dp, Brush.linearGradient(listOf(Color.White.copy(.45f), Color.White.copy(.04f)))),
+                shape
+            )
+            .padding(16.dp),
+        content = content,
+    )
+}
+
+@Composable
+private fun ConnectOrb(connected: Boolean, onClick: () -> Unit) {
+    val pulse by rememberInfiniteTransition(label = "pulse").animateFloat(
+        1f, 1.18f,
+        infiniteRepeatable(tween(1600, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "s"
+    )
+    val tint = if (connected) Aqua else Color.White
+    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(210.dp)) {
+        if (connected) Box(
+            Modifier.size(170.dp).scale(pulse).alpha(.35f).border(2.dp, Aqua, CircleShape)
+        )
+        Box(
+            Modifier.size(170.dp).clip(CircleShape)
+                .background(Brush.radialGradient(listOf(tint.copy(.32f), tint.copy(.08f))))
+                .border(1.5.dp, Brush.linearGradient(listOf(tint.copy(.8f), tint.copy(.08f))), CircleShape)
+                .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                if (connected) "قطع کن" else "وصل شو",
+                color = TextMain, fontSize = 22.sp, fontWeight = FontWeight.SemiBold
+            )
+        }
+    }
+}
+
+@Composable
+private fun ServerRow(s: Server, selected: Boolean, onSelect: () -> Unit, onDelete: () -> Unit) {
+    val shape = RoundedCornerShape(18.dp)
+    Row(
+        Modifier.fillMaxWidth().clip(shape)
+            .background(Color.White.copy(if (selected) .16f else .07f))
+            .border(1.dp, if (selected) Aqua.copy(.7f) else Color.White.copy(.12f), shape)
+            .clickable(onClick = onSelect).padding(14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(s.name, color = TextMain, fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+            Text("${s.protocol}  ${s.host}:${s.port}", color = TextDim, fontSize = 12.sp, maxLines = 1)
+        }
+        val ping = s.pingMs
+        Text(
+            when {
+                ping == null -> "—"
+                ping < 0 -> "خطا"
+                else -> "$ping ms"
+            },
+            color = when {
+                ping == null -> TextDim
+                ping < 0 -> Coral
+                ping < 300 -> Aqua
+                else -> Color(0xFFFFC857)
+            },
+            fontSize = 13.sp,
+        )
+        Text(
+            "✕", color = TextDim, fontSize = 16.sp,
+            modifier = Modifier.padding(start = 14.dp).clickable(onClick = onDelete)
+        )
+    }
+}
+
+@Composable
+private fun GlassButton(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(16.dp)
+    Box(
+        modifier.clip(shape).background(Color.White.copy(.10f))
+            .border(1.dp, Color.White.copy(.25f), shape)
+            .clickable(onClick = onClick).padding(vertical = 14.dp),
+        contentAlignment = Alignment.Center,
+    ) { Text(label, color = TextMain, fontSize = 14.sp) }
+}
+
+/* ───────────── صفحه‌ی اصلی ───────────── */
+
+@Composable
+fun GlassRayApp(vm: MainVM, onToggle: () -> Unit) {
+    val servers by vm.servers.collectAsStateWithLifecycle()
+    val selectedId by vm.selectedId.collectAsStateWithLifecycle()
+    val connected by VpnState.connected.collectAsStateWithLifecycle()
+    val clipboard = LocalClipboardManager.current
+    var message by remember { mutableStateOf<String?>(null) }
+    val current = servers.firstOrNull { it.id == selectedId }
+
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+        GlassBackground {
+            Column(
+                Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()
+                    .padding(horizontal = 20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Spacer(Modifier.height(20.dp))
+                Text("GlassRay", color = TextMain, fontSize = 26.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    if (connected) "متصل هستی" else "قطع است",
+                    color = if (connected) Aqua else TextDim, fontSize = 14.sp
+                )
+
+                ConnectOrb(connected) {
+                    if (current == null) message = "اول یک سرور اضافه کن" else onToggle()
+                }
+
+                GlassCard(Modifier.fillMaxWidth()) {
+                    Text("سرور انتخاب‌شده", color = TextDim, fontSize = 12.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        current?.name ?: "هنوز سروری اضافه نشده",
+                        color = TextMain, fontSize = 17.sp, fontWeight = FontWeight.Medium
+                    )
+                }
+
+                message?.let {
+                    Spacer(Modifier.height(8.dp))
+                    Text(it, color = Coral, fontSize = 13.sp)
+                }
+
+                Spacer(Modifier.height(14.dp))
+                LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    items(servers, key = { it.id }) { s ->
+                        ServerRow(
+                            s, s.id == selectedId,
+                            onSelect = { vm.select(s.id) },
+                            onDelete = { vm.delete(s.id) }
+                        )
+                    }
+                }
+
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 14.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    GlassButton("افزودن از کلیپ‌بورد", Modifier.weight(1f)) {
+                        val n = vm.import(clipboard.getText()?.text.orEmpty())
+                        message = if (n == 0) "لینک معتبری در کلیپ‌بورد نبود (vmess / vless / trojan / ss)" else null
+                    }
+                    GlassButton("تست پینگ", Modifier.weight(1f)) { vm.pingAll() }
+                }
+            }
+        }
+    }
+}
+
+class MainActivity : ComponentActivity() {
+    private val vm by viewModels<MainVM>()
+
+    private val vpnPermission =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            if (it.resultCode == RESULT_OK) startVpn()
+        }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent { GlassRayApp(vm, onToggle = ::toggle) }
+    }
+
+    private fun toggle() {
+        if (VpnState.connected.value) {
+            startService(Intent(this, GlassVpnService::class.java).setAction(ACTION_STOP))
+        } else {
+            val ask = VpnService.prepare(this)
+            if (ask != null) vpnPermission.launch(ask) else startVpn()
+        }
+    }
+
+    private fun startVpn() {
+        val server = vm.selected() ?: return
+        startService(Intent(this, GlassVpnService::class.java).putExtra(EXTRA_LINK, server.raw))
+    }
+}
